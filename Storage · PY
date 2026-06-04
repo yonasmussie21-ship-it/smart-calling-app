@@ -1,0 +1,133 @@
+"""
+Persistent storage — SQLite, same philosophy as King Bot's storage.py:
+a single file on the Oracle box, survives restarts, zero infra cost.
+
+Two tables:
+  users         - who's using the bot (acquisition record)
+  transactions  - the ledger: every top-up, wholesale cost, retail, margin
+
+The transactions table doubles as your accounting source of truth.
+SUM(margin_gbp) WHERE status='SUCCESSFUL' is your gross profit.
+"""
+
+import sqlite3
+import time
+from contextlib import contextmanager
+
+import config
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    telegram_id   INTEGER PRIMARY KEY,
+    username      TEXT,
+    first_seen    INTEGER,
+    last_seen     INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS transactions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    custom_identifier TEXT UNIQUE,
+    telegram_id       INTEGER,
+    iso2              TEXT,
+    operator_id       INTEGER,
+    recipient         TEXT,
+    send_value_gbp    REAL,
+    retail_gbp        REAL,
+    margin_gbp        REAL,
+    status            TEXT,          -- PENDING_PAYMENT / PAID / SUCCESSFUL / FAILED
+    reloadly_tx_id    INTEGER,
+    created_at        INTEGER,
+    updated_at        INTEGER
+);
+"""
+
+
+@contextmanager
+def _conn():
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with _conn() as conn:
+        conn.executescript(SCHEMA)
+
+
+# --- users ----------------------------------------------------------------
+def upsert_user(telegram_id: int, username: str | None):
+    now = int(time.time())
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO users (telegram_id, username, first_seen, last_seen)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(telegram_id) DO UPDATE SET
+                 username = excluded.username,
+                 last_seen = excluded.last_seen""",
+            (telegram_id, username, now, now),
+        )
+
+
+def user_count() -> int:
+    with _conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+# --- transactions ---------------------------------------------------------
+def create_transaction(
+    custom_identifier: str,
+    telegram_id: int,
+    iso2: str,
+    operator_id: int,
+    recipient: str,
+    send_value_gbp: float,
+    retail_gbp: float,
+    margin_gbp: float,
+):
+    now = int(time.time())
+    with _conn() as conn:
+        conn.execute(
+            """INSERT INTO transactions
+               (custom_identifier, telegram_id, iso2, operator_id, recipient,
+                send_value_gbp, retail_gbp, margin_gbp, status,
+                created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_PAYMENT', ?, ?)""",
+            (custom_identifier, telegram_id, iso2, operator_id, recipient,
+             send_value_gbp, retail_gbp, margin_gbp, now, now),
+        )
+
+
+def update_transaction(custom_identifier: str, **fields):
+    if not fields:
+        return
+    fields["updated_at"] = int(time.time())
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with _conn() as conn:
+        conn.execute(
+            f"UPDATE transactions SET {cols} WHERE custom_identifier = ?",
+            (*fields.values(), custom_identifier),
+        )
+
+
+def recent_for_user(telegram_id: int, limit: int = 5) -> list[sqlite3.Row]:
+    with _conn() as conn:
+        return conn.execute(
+            """SELECT * FROM transactions
+               WHERE telegram_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (telegram_id, limit),
+        ).fetchall()
+
+
+def total_margin() -> float:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(margin_gbp), 0) FROM transactions "
+            "WHERE status = 'SUCCESSFUL'"
+        ).fetchone()
+        return float(row[0])
