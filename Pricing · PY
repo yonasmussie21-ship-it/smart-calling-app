@@ -1,1 +1,52 @@
+"""
+Pricing logic — the bit that actually makes you money.
 
+Model: the customer chooses a "send value" in GBP (what the recipient
+receives, before markup). That send value is your wholesale cost to
+Reloadly. You charge the customer that value plus a markup. The
+difference is your gross margin.
+
+Keeping the wallet/e-money problem at bay: there is NO stored customer
+balance here. Every top-up is a discrete, pay-as-you-go transaction.
+Customer funds are never held by you, which keeps this layer out of
+e-money / EMI territory.
+"""
+
+from dataclasses import dataclass
+
+import config
+
+
+@dataclass
+class Quote:
+    iso2: str
+    send_value_gbp: float    # wholesale cost (what leaves your Reloadly float)
+    markup_rate: float       # fraction applied
+    retail_gbp: float        # what the customer pays
+    margin_gbp: float        # your gross profit on this transaction
+
+    def summary(self) -> str:
+        return (
+            f"Recipient gets: £{self.send_value_gbp:.2f} of airtime\n"
+            f"You pay: £{self.retail_gbp:.2f}"
+        )
+
+
+def markup_for(iso2: str) -> float:
+    corridor = config.CORRIDORS.get(iso2, {})
+    override = corridor.get("markup")
+    return override if override is not None else config.DEFAULT_MARKUP
+
+
+def quote(iso2: str, send_value_gbp: float) -> Quote:
+    """Build a price quote for a given corridor and send value."""
+    rate = markup_for(iso2)
+    retail = round(send_value_gbp * (1 + rate), 2)
+    margin = round(retail - send_value_gbp, 2)
+    return Quote(
+        iso2=iso2,
+        send_value_gbp=round(send_value_gbp, 2),
+        markup_rate=rate,
+        retail_gbp=retail,
+        margin_gbp=margin,
+    )
