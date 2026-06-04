@@ -1,0 +1,51 @@
+"""
+Payment collection — the deliberately-stubbed seam.
+
+You must collect the retail price from the customer BEFORE calling
+Reloadly, otherwise you're fronting cash on every transaction. This
+module is the single place that logic lives, so swapping in a real
+PSP later touches nothing else.
+
+Drop-in options when you're ready:
+  - Stripe Payment Links / Checkout (cards, Apple/Google Pay)
+  - Wise / Open Banking for low-fee bank transfers
+  - Telegram's own Payments API (Bot Payments 2.0) for in-chat checkout
+
+In sandbox the FakePaymentProvider auto-confirms so you can test the
+full top-up flow end to end without wiring a PSP first.
+"""
+
+import logging
+import config
+
+log = logging.getLogger(__name__)
+
+
+class PaymentProvider:
+    def create_charge(self, *, amount_gbp: float, reference: str,
+                      description: str) -> dict:
+        """Return {'paid': bool, 'checkout_url': str | None, 'charge_id': str}."""
+        raise NotImplementedError
+
+
+class FakePaymentProvider(PaymentProvider):
+    """Sandbox-only: pretends payment succeeded. NEVER use in production."""
+
+    def create_charge(self, *, amount_gbp, reference, description):
+        log.warning("FAKE payment auto-confirmed for %s (£%.2f)", reference, amount_gbp)
+        return {"paid": True, "checkout_url": None, "charge_id": f"fake_{reference}"}
+
+
+# TODO: implement StripeProvider.create_charge using a Payment Link or
+# Checkout Session, returning checkout_url and paid=False until the
+# webhook confirms. Then verify status before send_topup() runs.
+
+
+def get_provider() -> PaymentProvider:
+    if config.RELOADLY_SANDBOX:
+        return FakePaymentProvider()
+    raise RuntimeError(
+        "No live PaymentProvider configured. Implement StripeProvider (or "
+        "another PSP) in payments.py before going live — you must not run "
+        "top-ups without collecting payment first."
+    )
