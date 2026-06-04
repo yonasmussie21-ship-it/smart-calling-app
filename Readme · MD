@@ -1,0 +1,72 @@
+# Smart Calling App
+
+The umbrella product for the UK African diaspora: cheap calls, airtime
+top-up, and (later) remittance under one roof. This repo currently ships
+**feature one — the Telegram-native airtime/data top-up bot**, which is
+the front door *and* your first real margin. Built on the same Oracle
+Cloud + Telegram + CI/CD stack as King Bot.
+
+Roadmap inside this repo:
+- ✅ **Layer 1 — Airtime/data top-up** (this build): light regulation, real margin, no FCA licence.
+- ⏳ **Layer 0 — Calls**: the brand's namesake, slots in once you have users.
+- ⏳ **Layer 2 — Remittance**: via an agent-of-a-licensed-PI or RaaS partner.
+- ⏳ **Layer 3 — Wallets / Family Vaults**: EMI territory, the endgame.
+
+## How the money works
+
+Customer picks a send value (what the recipient receives) → you charge
+that value **plus a markup** (default 12%) → the difference is your gross
+margin, logged per transaction. No stored customer balance, so this layer
+stays out of e-money / EMI regulation. Payment is always collected
+**before** the top-up fires (see `payments.py`).
+
+```
+Recipient gets £5.00 airtime
+Customer pays   £5.60   (12% markup)
+Your margin     £0.60
+```
+
+## Files
+
+| File | Role |
+|------|------|
+| `config.py` | Env config, supported corridors, markup |
+| `reloadly_client.py` | Reloadly Airtime API wrapper (OAuth, operators, top-up, balance) |
+| `pricing.py` | Markup / margin computation |
+| `storage.py` | SQLite users + transaction ledger |
+| `payments.py` | Payment-provider seam (Stripe/Wise/Telegram Payments go here) |
+| `telegram_bot.py` | Conversation flow + handlers |
+| `main.py` | Entry point |
+| `deploy.sh` | Oracle Cloud deploy/restart |
+
+## Quick start (sandbox)
+
+1. Create a bot with @BotFather, grab the token.
+2. Sign up at reloadly.com → Developers → API settings → copy the **test**
+   client ID/secret. Your test wallet comes pre-funded.
+3. `cp .env.example .env` and fill it in (keep `RELOADLY_SANDBOX=true`).
+4. `pip install -r requirements.txt`
+5. `python main.py`
+6. In Telegram: `/topup` → pick Nigeria → send a number → pick £5 → confirm.
+   The `FakePaymentProvider` auto-confirms payment so you can test the full
+   flow without a PSP. `/admin` shows users, margin, and your Reloadly float.
+
+## Going live
+
+1. Implement `StripeProvider` (or another PSP) in `payments.py` — return
+   `paid=False` + a checkout URL, confirm via webhook before `send_topup`.
+2. Fund your **live** Reloadly wallet.
+3. Swap to live keys, set `RELOADLY_SANDBOX=false`.
+4. Add a refund path for the `FAILED` branch in `telegram_bot.py`.
+5. Deploy: drop into `/home/ubuntu/smart-calling-app`, add a `smart-calling-app`
+   systemd unit, reuse your GitHub Actions `appleboy/ssh-action` workflow
+   pointing at `deploy.sh`.
+
+## Regulatory note
+
+Reselling airtime/data top-up is digital-goods commerce, **not** regulated
+money remittance — no FCA licence needed for this layer. The moment you add
+**cash remittance** (Layer 2: GBP in, local cash/bank/mobile-money out) you
+need to operate as an agent of an authorised Payment Institution, or via a
+licensed remittance-as-a-service partner. Get a payments-specialist adviser
+before that layer. This is general information, not legal advice.
