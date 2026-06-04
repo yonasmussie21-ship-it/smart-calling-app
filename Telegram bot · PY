@@ -1,0 +1,286 @@
+"""
+Telegram-native top-up flow.
+
+Conversation: /topup -> pick country -> send recipient number ->
+pick amount -> confirm -> pay -> top-up executes -> receipt.
+
+Built on python-telegram-bot v20+ (async). Mirrors King Bot's
+telegram_bot.py layering: handlers here, wiring in main.py.
+"""
+
+import logging
+import uuid
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    filters,
+)
+
+import config
+import storage
+import pricing
+from reloadly_client import ReloadlyClient, ReloadlyError
+from payments import get_provider
+
+log = logging.getLogger(__name__)
+
+reloadly = ReloadlyClient()
+payments = get_provider()
+
+# Conversation states
+CHOOSE_COUNTRY, ENTER_NUMBER, CHOOSE_AMOUNT, CONFIRM = range(4)
+
+
+# --- basic commands -------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    storage.upsert_user(user.id, user.username)
+    await update.message.reply_text(
+        f"👋 Welcome{', ' + user.first_name if user.first_name else ''}!\n\n"
+        "Send airtime home in seconds — straight to any phone, no app for "
+        "the person receiving it.\n\n"
+        "Tap /topup to send credit, or /help to see everything."
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Commands:\n"
+        "/topup — send airtime to a phone abroad\n"
+        "/history — your recent top-ups\n"
+        "/help — this message\n\n"
+        "We support: "
+        + ", ".join(f"{c['flag']} {c['name']}" for c in config.CORRIDORS.values())
+    )
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = storage.recent_for_user(update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("No top-ups yet. Tap /topup to send your first.")
+        return
+    lines = ["🧾 Your recent top-ups:\n"]
+    for r in rows:
+        flag = config.CORRIDORS.get(r["iso2"], {}).get("flag", "")
+        lines.append(
+            f"{flag} {r['recipient']} — £{r['retail_gbp']:.2f} — {r['status']}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+# --- top-up conversation --------------------------------------------------
+async def topup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    buttons = [
+        [InlineKeyboardButton(f"{c['flag']} {c['name']}", callback_data=f"country:{iso}")]
+        for iso, c in config.CORRIDORS.items()
+    ]
+    await update.message.reply_text(
+        "Which country are you sending to?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CHOOSE_COUNTRY
+
+
+async def country_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    iso2 = query.data.split(":", 1)[1]
+    context.user_data["iso2"] = iso2
+    corridor = config.CORRIDORS[iso2]
+    await query.edit_message_text(
+        f"{corridor['flag']} {corridor['name']} it is.\n\n"
+        f"Send me the recipient's phone number "
+        f"(with or without the +{corridor['dial']} code)."
+    )
+    return ENTER_NUMBER
+
+
+def _normalise_number(raw: str, dial: str) -> tuple[str, str]:
+    """Return (country_dial_code, national_number) from messy user input."""
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if digits.startswith(dial):
+        national = digits[len(dial):]
+    elif digits.startswith("0"):
+        national = digits.lstrip("0")
+    else:
+        national = digits
+    return dial, national
+
+
+async def number_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    iso2 = context.user_data["iso2"]
+    corridor = config.CORRIDORS[iso2]
+    dial, national = _normalise_number(update.message.text, corridor["dial"])
+
+    if len(national) < 6:
+        await update.message.reply_text("That doesn't look right — try the full number.")
+        return ENTER_NUMBER
+
+    context.user_data["dial"] = dial
+    context.user_data["national"] = national
+    context.user_data["recipient"] = f"+{dial}{national}"
+
+    # Auto-detect the operator so we top up the correct network.
+    try:
+        operator = reloadly.autodetect_operator(national, iso2)
+        context.user_data["operator_id"] = operator["operatorId"]
+        context.user_data["operator_name"] = operator.get("name", "operator")
+    except (ReloadlyError, KeyError) as e:
+        log.error("Operator detect failed: %s", e)
+        await update.message.reply_text(
+            "Couldn't detect the network for that number. "
+            "Double-check it and try /topup again."
+        )
+        return ConversationHandler.END
+
+    buttons = [
+        [InlineKeyboardButton(f"£{v}", callback_data=f"amount:{v}")]
+        for v in corridor["presets"]
+    ]
+    await update.message.reply_text(
+        f"📶 Detected: {context.user_data['operator_name']}\n\n"
+        "How much airtime should they receive?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return CHOOSE_AMOUNT
+
+
+async def amount_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    send_value = float(query.data.split(":", 1)[1])
+    iso2 = context.user_data["iso2"]
+    q = pricing.quote(iso2, send_value)
+    context.user_data["quote"] = q
+
+    corridor = config.CORRIDORS[iso2]
+    await query.edit_message_text(
+        f"Confirm your top-up:\n\n"
+        f"{corridor['flag']} {corridor['name']}\n"
+        f"📱 {context.user_data['recipient']}\n"
+        f"{q.summary()}\n\n"
+        "Tap to confirm 👇",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("✅ Pay & send", callback_data="confirm:yes")],
+             [InlineKeyboardButton("❌ Cancel", callback_data="confirm:no")]]
+        ),
+    )
+    return CONFIRM
+
+
+async def confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data.endswith(":no"):
+        await query.edit_message_text("Cancelled. Tap /topup to start again.")
+        return ConversationHandler.END
+
+    q = context.user_data["quote"]
+    ref = uuid.uuid4().hex[:16]
+    user = update.effective_user
+
+    storage.create_transaction(
+        custom_identifier=ref,
+        telegram_id=user.id,
+        iso2=q.iso2,
+        operator_id=context.user_data["operator_id"],
+        recipient=context.user_data["recipient"],
+        send_value_gbp=q.send_value_gbp,
+        retail_gbp=q.retail_gbp,
+        margin_gbp=q.margin_gbp,
+    )
+
+    # 1) collect payment FIRST (never front the cash)
+    charge = payments.create_charge(
+        amount_gbp=q.retail_gbp,
+        reference=ref,
+        description=f"Airtime to {context.user_data['recipient']}",
+    )
+    if not charge["paid"]:
+        storage.update_transaction(ref, status="PENDING_PAYMENT")
+        await query.edit_message_text(
+            f"💳 Complete payment to finish:\n{charge['checkout_url']}"
+        )
+        return ConversationHandler.END
+    storage.update_transaction(ref, status="PAID")
+
+    # 2) only now move the airtime
+    await query.edit_message_text("⏳ Sending airtime…")
+    try:
+        result = reloadly.send_topup(
+            operator_id=context.user_data["operator_id"],
+            amount=q.send_value_gbp,
+            recipient_country_code=context.user_data["dial"],
+            recipient_number=context.user_data["national"],
+            custom_identifier=ref,
+        )
+        storage.update_transaction(
+            ref, status="SUCCESSFUL", reloadly_tx_id=result.get("transactionId")
+        )
+        await query.edit_message_text(
+            f"✅ Done! £{q.send_value_gbp:.2f} airtime sent to "
+            f"{context.user_data['recipient']}.\n\nThanks — /topup to send again."
+        )
+    except ReloadlyError as e:
+        log.error("Top-up execution failed for %s: %s", ref, e)
+        storage.update_transaction(ref, status="FAILED")
+        # NOTE: payment was taken — trigger your refund flow here.
+        await query.edit_message_text(
+            "⚠️ Top-up failed after payment. You'll be refunded — "
+            "we've logged it and will sort it out."
+        )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# --- admin ----------------------------------------------------------------
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in config.ADMIN_IDS:
+        return
+    try:
+        bal = reloadly.get_balance()
+        bal_str = f"£{bal.get('balance', 0):.2f} {bal.get('currencyCode', '')}"
+    except ReloadlyError as e:
+        bal_str = f"(error: {e})"
+    await update.message.reply_text(
+        f"📊 Admin\n"
+        f"Users: {storage.user_count()}\n"
+        f"Gross margin to date: £{storage.total_margin():.2f}\n"
+        f"Reloadly float: {bal_str}\n"
+        f"Mode: {'SANDBOX' if config.RELOADLY_SANDBOX else 'LIVE'}"
+    )
+
+
+def build_handlers() -> list:
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("topup", topup_start)],
+        states={
+            CHOOSE_COUNTRY: [CallbackQueryHandler(country_chosen, pattern="^country:")],
+            ENTER_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, number_entered)],
+            CHOOSE_AMOUNT: [CallbackQueryHandler(amount_chosen, pattern="^amount:")],
+            CONFIRM: [CallbackQueryHandler(confirmed, pattern="^confirm:")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    return [
+        CommandHandler("start", start),
+        CommandHandler("help", help_cmd),
+        CommandHandler("history", history),
+        CommandHandler("admin", admin),
+        conv,
+    ]
