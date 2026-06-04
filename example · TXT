@@ -1,0 +1,20 @@
+# --- Telegram ---
+TELEGRAM_TOKEN=your-botfather-token
+ADMIN_IDS=123456789
+
+# --- Reloadly ---
+# Get these from Reloadly dashboard > Developers > API settings.
+# Toggle test/live in the dashboard to see the matching key pair.
+RELOADLY_CLIENT_ID=your-client-id
+RELOADLY_CLIENT_SECRET=your-client-secret
+
+# Keep "true" until you've tested in sandbox and funded your live wallet.
+RELOADLY_SANDBOX=true
+
+# --- Pricing ---
+# Your markup over wholesale. 0.12 = 12%.
+DEFAULT_MARKUP=0.12
+WALLET_CURRENCY=GBP
+
+# --- Storage ---
+DB_PATH=topup_bot.db
