@@ -1,0 +1,81 @@
+"""
+Central configuration for the Diaspora Top-Up Bot.
+
+All secrets come from environment variables (see .env.example).
+Nothing sensitive is hard-coded so this drops safely onto the Oracle
+Cloud box next to King Bot and into GitHub Actions secrets.
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+# --- Telegram -------------------------------------------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+# Comma-separated Telegram user IDs allowed to run /admin commands.
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
+
+
+# --- Reloadly -------------------------------------------------------------
+RELOADLY_CLIENT_ID = os.getenv("RELOADLY_CLIENT_ID", "")
+RELOADLY_CLIENT_SECRET = os.getenv("RELOADLY_CLIENT_SECRET", "")
+
+# Flip to "false" once you've tested in sandbox and funded the live wallet.
+RELOADLY_SANDBOX = os.getenv("RELOADLY_SANDBOX", "true").lower() == "true"
+
+# Reloadly endpoints differ between sandbox and live.
+AUTH_URL = "https://auth.reloadly.com/oauth/token"
+TOPUPS_BASE = (
+    "https://topups-sandbox.reloadly.com"
+    if RELOADLY_SANDBOX
+    else "https://topups.reloadly.com"
+)
+# The audience the OAuth token is minted for must match the base host.
+TOPUPS_AUDIENCE = TOPUPS_BASE
+# Reloadly versions its top-up resources via the Accept header.
+TOPUPS_ACCEPT = "application/com.reloadly.topups-v1+json"
+
+
+# --- Pricing --------------------------------------------------------------
+# Your retail markup over Reloadly's wholesale cost, as a fraction.
+# 0.12 = 12%. This is where your margin lives. Tune per corridor below if needed.
+DEFAULT_MARKUP = float(os.getenv("DEFAULT_MARKUP", "0.12"))
+
+# The currency your Reloadly wallet is funded in (UK account => GBP).
+WALLET_CURRENCY = os.getenv("WALLET_CURRENCY", "GBP")
+
+
+# --- Corridors ------------------------------------------------------------
+# The diaspora destinations you support, keyed by ISO-2 country code.
+# `dial` is the international dialling prefix (used for number normalisation).
+# `markup` overrides DEFAULT_MARKUP for that corridor when set.
+# Presets are the GBP "send values" (what the recipient receives, pre-markup).
+CORRIDORS = {
+    "NG": {"name": "Nigeria",     "dial": "234", "flag": "🇳🇬", "markup": None, "presets": [3, 5, 10, 20]},
+    "GH": {"name": "Ghana",       "dial": "233", "flag": "🇬🇭", "markup": None, "presets": [3, 5, 10, 20]},
+    "KE": {"name": "Kenya",       "dial": "254", "flag": "🇰🇪", "markup": None, "presets": [3, 5, 10, 20]},
+    "ET": {"name": "Ethiopia",    "dial": "251", "flag": "🇪🇹", "markup": None, "presets": [3, 5, 10, 20]},
+    "ZA": {"name": "South Africa","dial": "27",  "flag": "🇿🇦", "markup": None, "presets": [3, 5, 10, 20]},
+    "UG": {"name": "Uganda",      "dial": "256", "flag": "🇺🇬", "markup": None, "presets": [3, 5, 10, 20]},
+    "TZ": {"name": "Tanzania",    "dial": "255", "flag": "🇹🇿", "markup": None, "presets": [3, 5, 10, 20]},
+}
+
+
+# --- Storage --------------------------------------------------------------
+DB_PATH = os.getenv("DB_PATH", "topup_bot.db")
+
+
+def validate() -> list[str]:
+    """Return a list of missing-config problems (empty list == good to go)."""
+    problems = []
+    if not TELEGRAM_TOKEN:
+        problems.append("TELEGRAM_TOKEN is not set")
+    if not RELOADLY_CLIENT_ID:
+        problems.append("RELOADLY_CLIENT_ID is not set")
+    if not RELOADLY_CLIENT_SECRET:
+        problems.append("RELOADLY_CLIENT_SECRET is not set")
+    return problems
