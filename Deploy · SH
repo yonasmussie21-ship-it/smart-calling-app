@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Deploy / restart the top-up bot on the Oracle Cloud box.
+# Mirrors King Bot's pattern: pull, install, restart under systemd.
+set -euo pipefail
+
+APP_DIR="/home/ubuntu/smart-calling-app"
+SERVICE="smart-calling-app"
+
+cd "$APP_DIR"
+
+echo "==> Pulling latest"
+git pull --ff-only
+
+echo "==> Installing deps"
+python3 -m pip install --quiet -r requirements.txt
+
+echo "==> Restarting service"
+sudo systemctl restart "$SERVICE"
+sudo systemctl --no-pager status "$SERVICE" | head -n 5
+
+echo "==> Done"
